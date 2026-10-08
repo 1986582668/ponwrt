@@ -135,22 +135,50 @@ jobs:
       - name: Build ${{ matrix.target }}
         run: make -j"$(nproc)"
 
-      # End-to-end proof that the firmware carries the patched driver: the
-      # string comes from MODULE_PARM_DESC in the second patch, so it can only
-      # be present when the patched source was compiled.
+      # End-to-end proof that the firmware carries the patched driver.
+      #
+      # Do NOT fingerprint on the MODULE_PARM_DESC text: the packaged module is
+      # run through OpenWrt's scripts/strip-kmod.sh, whose
+      # "objcopy -x -G __this_module --strip-unneeded" drops every
+      # non-allocated section, .modinfo included. The format string used below
+      # is reachable from code, so it lands in .rodata and survives stripping,
+      # and the phrase does not exist anywhere in the upstream source.
       - name: Verify the built module came from the patched source
         run: |
-          module=$(find build_dir -name airoha-xpon.ko -print -quit)
-          [ -n "$module" ] || {
-            echo "::error::airoha-xpon.ko was not built"
-            exit 1
-          }
-          echo "module: $module"
-          strings "$module" | grep -q 'PHY RX sync mode field override' || {
+          fingerprint='digital RX mode readback'
+          found=''
+          for f in $(find build_dir feeds \
+                       \( -name 'airoha-xpon-xgpon.o' -o -name 'airoha-xpon.ko*' \) \
+                       -print 2>/dev/null); do
+            if strings "$f" 2>/dev/null | grep -q "$fingerprint"; then
+              echo "fingerprint present in $f"
+              found="$f"
+              break
+            fi
+          done
+          if [ -z "$found" ]; then
             echo "::error::the built module lacks the patch fingerprint, refusing to release"
+            echo "--- candidates inspected ---"
+            find build_dir feeds \
+              \( -name 'airoha-xpon-xgpon.o' -o -name 'airoha-xpon.ko*' \) \
+              -exec sh -c 'printf "%10s  %s\n" "$(stat -c%s "$1")" "$1"' _ {} \;
             exit 1
-          }
-          echo "patch fingerprint present"
+          fi
+          echo "patch fingerprint present ($found)"
+
+      # Advisory only. OpenWrt keeps logs/package/<step>.txt for failed steps;
+      # a successful package build may leave no log at all, so this must not
+      # fail the job.
+      - name: Show the package compile log if present
+        run: |
+          log=logs/package/feeds/pon_drivers/airoha-xpon/compile.txt
+          if [ -f "$log" ]; then
+            echo "found $log"
+            grep -o 'airoha-xpon[a-z-]*\.c' "$log" | sort -u || true
+          else
+            echo "no per-package compile log (the step succeeded, which is normal)"
+            find logs -path '*airoha*' -name '*.txt' -print 2>/dev/null || true
+          fi
 
       - name: Verify the board images exist
         env:

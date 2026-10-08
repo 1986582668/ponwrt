@@ -91,4 +91,12 @@ check "all six line modes are mac_supported" \
 check "the RX mode diagnostic override is present" \
 	grep -q 'module_param(rx_mode_override' "$XPON/airoha-xpon-xgpon.c"
 
+# This one is the *binary* fingerprint, so it must live in an allocated
+# section. MODULE_PARM_DESC text ends up in .modinfo, which the OpenWrt
+# scripts/strip-kmod.sh step ("objcopy -x -G __this_module --strip-unneeded")
+# drops from the packaged module. A format string reachable from code lands in
+# .rodata instead and survives stripping. Neither phrase exists upstream.
+check "the RX mode diagnostic log string is present" \
+	grep -q 'digital RX mode readback' "$XPON/airoha-xpon-xgpon.c"
+
 echo "GPON patches verified in $FEED_SRC"
