@@ -1,0 +1,69 @@
+diff --git a/airoha-xpon/src/airoha-xpon-mode.c b/airoha-xpon/src/airoha-xpon-mode.c
+index 8359949..89f5c26 100644
+--- a/airoha-xpon/src/airoha-xpon-mode.c
++++ b/airoha-xpon/src/airoha-xpon-mode.c
+@@ -17,6 +17,7 @@ static const struct airoha_xpon_mode_info airoha_xpon_modes[] = {
+ 		.name = "gpon",
+ 		.frontend_mode = AIROHA_PON_FRONTEND_MODE_GPON,
+ 		.control_protocol = AIROHA_XPON_CONTROL_OMCI,
++		.mac_supported = true,
+ 	},
+ 	{
+ 		.mode = AIROHA_XPON_MODE_XGPON,
+@@ -94,6 +95,28 @@ bool airoha_xpon_pcs_profile_matches(enum airoha_xpon_mode mode,
+ 	}
+ }
+ 
++/* Map a line mode onto the PCS profile that carries its line rate. */
++enum airoha_pcs_pon_mode
++airoha_xpon_mode_to_pcs_profile(enum airoha_xpon_mode mode)
++{
++	switch (mode) {
++	case AIROHA_XPON_MODE_GPON:
++		return AIROHA_PCS_PON_MODE_GPON;
++	case AIROHA_XPON_MODE_XGPON:
++		return AIROHA_PCS_PON_MODE_XGPON;
++	case AIROHA_XPON_MODE_XGSPON:
++		return AIROHA_PCS_PON_MODE_XGSPON;
++	case AIROHA_XPON_MODE_EPON_1G:
++		return AIROHA_PCS_PON_MODE_EPON_1G;
++	case AIROHA_XPON_MODE_EPON_10G_1G:
++		return AIROHA_PCS_PON_MODE_EPON_10G_1G;
++	case AIROHA_XPON_MODE_EPON_10G_10G:
++		return AIROHA_PCS_PON_MODE_EPON_10G_10G;
++	default:
++		return AIROHA_PCS_PON_MODE_XGPON;
++	}
++}
++
+ int airoha_xpon_mode_parse(const char *name, enum airoha_xpon_mode *mode)
+ {
+ 	unsigned int i;
+diff --git a/airoha-xpon/src/airoha-xpon-private.h b/airoha-xpon/src/airoha-xpon-private.h
+index eabcd9c..2de99b0 100644
+--- a/airoha-xpon/src/airoha-xpon-private.h
++++ b/airoha-xpon/src/airoha-xpon-private.h
+@@ -350,6 +350,8 @@ airoha_xpon_mode_info(enum airoha_xpon_mode mode);
+ const char *airoha_xpon_mode_name(enum airoha_xpon_mode mode);
+ bool airoha_xpon_pcs_profile_matches(enum airoha_xpon_mode mode,
+                                      enum airoha_pcs_pon_mode profile);
++enum airoha_pcs_pon_mode
++airoha_xpon_mode_to_pcs_profile(enum airoha_xpon_mode mode);
+ int airoha_xpon_mode_parse(const char *name, enum airoha_xpon_mode *mode);
+ int airoha_xpon_mode_get_default(struct device *dev,
+                                  enum airoha_xpon_mode *mode);
+diff --git a/airoha-xpon/src/airoha-xpon-xgpon.c b/airoha-xpon/src/airoha-xpon-xgpon.c
+index fb86a12..e50c3d2 100644
+--- a/airoha-xpon/src/airoha-xpon-xgpon.c
++++ b/airoha-xpon/src/airoha-xpon-xgpon.c
+@@ -494,9 +494,7 @@ int airoha_xpon_xgpon_start_rx(struct airoha_xpon *xpon)
+ 	u32 onu_id;
+ 	int ret;
+ 
+-	pcs_mode = xpon->active_mode == AIROHA_XPON_MODE_XGSPON ?
+-	                   AIROHA_PCS_PON_MODE_XGSPON :
+-	                   AIROHA_PCS_PON_MODE_XGPON;
++	pcs_mode = airoha_xpon_mode_to_pcs_profile(xpon->active_mode);
+ 	retrain = xpon->pcs_profile_valid && xpon->pcs_profile == pcs_mode;
+ 	if (!retrain) {
+ 		ret = airoha_pcs_pon_config_rx(

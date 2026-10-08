@@ -1,0 +1,84 @@
+diff --git a/airoha-xpon/src/airoha-xpon-xgpon.c b/airoha-xpon/src/airoha-xpon-xgpon.c
+index fb86a12..e2e3a52 100644
+--- a/airoha-xpon/src/airoha-xpon-xgpon.c
++++ b/airoha-xpon/src/airoha-xpon-xgpon.c
+@@ -4,12 +4,28 @@
+ #include <linux/bitfield.h>
+ #include <linux/delay.h>
+ #include <linux/iopoll.h>
++#include <linux/module.h>
+ #include <linux/workqueue.h>
+ 
+ #include "airoha-xpon-private.h"
+ #include "airoha-xpon-omci.h"
+ #include "airoha-xpon-xgpon.h"
+ 
++/*
++ * Diagnostic override for the digital receiver mode field.
++ *
++ * The open driver always programs PHY_RX_SYNC_CTRL for the XG-PON rate.
++ * GPON runs at a different downstream rate and its encoding in the
++ * undocumented mode field is unknown, so the field can be forced at load
++ * time instead of being rebuilt for every guess. A negative value keeps the
++ * upstream behaviour, including the readback assertion; any other value is
++ * written as the raw field value and a mismatching readback is only logged.
++ */
++static int rx_mode_override = -1;
++module_param(rx_mode_override, int, 0644);
++MODULE_PARM_DESC(rx_mode_override,
++                 "PHY RX sync mode field override, -1 keeps the XG-PON profile");
++
+ static void airoha_xpon_xgpon_release_mac_interfaces(struct airoha_xpon *xpon)
+ {
+ 	/* Clear MBI/MPI stop bits after SW_RST is released. */
+@@ -362,7 +378,7 @@ static int airoha_xpon_xgpon_release_digital_rx_reset(struct airoha_xpon *xpon)
+ 
+ static int airoha_xpon_xgpon_enable_digital_rx(struct airoha_xpon *xpon)
+ {
+-	u32 rx_ctrl;
++	u32 rx_ctrl, rx_mode;
+ 
+ 	airoha_pon_phy_write(xpon, AIROHA_XGPON_PHY_SFP_VLD_LEVEL,
+ 	                     xpon->frontend_link.xgpon_sfp_valid_level);
+@@ -372,17 +388,35 @@ static int airoha_xpon_xgpon_enable_digital_rx(struct airoha_xpon *xpon)
+ 	airoha_pon_phy_write(xpon, AIROHA_XGPON_PHY_INT_ENABLE,
+ 	                     AIROHA_XGPON_PHY_INT_RX_MASK);
+ 
++	rx_mode = rx_mode_override < 0 ?
++	                  AIROHA_XGPON_PHY_RX_MODE_XGPON :
++	                  FIELD_PREP(AIROHA_XGPON_PHY_RX_MODE_MASK,
++	                             (u32)rx_mode_override);
+ 	rx_ctrl = airoha_pon_phy_read(xpon, AIROHA_XGPON_PHY_RX_SYNC_CTRL);
+ 	airoha_pon_phy_write(xpon, AIROHA_XGPON_PHY_RX_SYNC_CTRL,
+ 	                     (rx_ctrl & ~AIROHA_XGPON_PHY_RX_MODE_MASK) |
+-	                             AIROHA_XGPON_PHY_RX_MODE_XGPON |
+-	                             AIROHA_XGPON_PHY_RX_ENABLE);
++	                             rx_mode | AIROHA_XGPON_PHY_RX_ENABLE);
+ 	rx_ctrl = airoha_pon_phy_read(xpon, AIROHA_XGPON_PHY_RX_SYNC_CTRL);
+ 
+-	return (rx_ctrl &
+-	        (AIROHA_XGPON_PHY_RX_MODE_MASK | AIROHA_XGPON_PHY_RX_ENABLE)) ==
+-	                       (AIROHA_XGPON_PHY_RX_MODE_XGPON |
+-	                        AIROHA_XGPON_PHY_RX_ENABLE) ?
++	if (!(rx_ctrl & AIROHA_XGPON_PHY_RX_ENABLE)) {
++		dev_err(xpon->dev,
++		        "digital RX enable did not stick, sync ctrl 0x%08x\n",
++		        rx_ctrl);
++		return -EIO;
++	}
++
++	if (rx_mode_override >= 0) {
++		if ((rx_ctrl & AIROHA_XGPON_PHY_RX_MODE_MASK) != rx_mode)
++			dev_warn(
++				xpon->dev,
++				"digital RX mode readback 0x%08x differs from requested 0x%08x\n",
++				rx_ctrl & AIROHA_XGPON_PHY_RX_MODE_MASK,
++				rx_mode);
++		return 0;
++	}
++
++	return (rx_ctrl & AIROHA_XGPON_PHY_RX_MODE_MASK) ==
++	               AIROHA_XGPON_PHY_RX_MODE_XGPON ?
+ 	               0 :
+ 	               -EIO;
+ }
