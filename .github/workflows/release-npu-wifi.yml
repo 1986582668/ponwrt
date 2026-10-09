@@ -33,6 +33,12 @@ name: Release PonWrt (WiFi flow offload)
 #
 #   No mt76 package Makefile change: CONFIG_MT76_NPU stays off for
 #   kmod-mt7915e, because none of the generic NPU plumbing is used.
+#
+# This build also carries the two feed patches that release-gpon.yml applies:
+# .github/patches on pon_drivers (the GPON line mode in airoha-xpon) and
+# .github/patches/pon_userspace on the LuCI PON page, which never offered that
+# line mode in its dropdown. Both are applied below and both are verified, so
+# this workflow cannot quietly ship a tree that lost either one.
 
 on:
   workflow_dispatch:
@@ -176,10 +182,13 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # Must run after the feed is cloned and before make starts. The script
+      # Must run after the feeds are cloned and before make starts. The script
       # aborts the job when a patch no longer applies or an assertion fails.
       - name: Apply GPON patches to the pon_drivers feed
-        run: sh .github/scripts/patch-feed.sh "$PWD"
+        run: sh .github/scripts/patch-feed.sh "$PWD" pon_drivers
+
+      - name: Apply GPON patches to the pon_userspace feed
+        run: sh .github/scripts/patch-feed.sh "$PWD" pon_userspace
 
       - name: Prepare APK signing key
         env:
@@ -214,6 +223,7 @@ jobs:
           grep -q '^CONFIG_PACKAGE_kmod-mt7915e=m$' .config
           grep -q '^CONFIG_PACKAGE_kmod-mt7916-firmware=m$' .config
           grep -q '^CONFIG_PACKAGE_kmod-airoha-xpon=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-app-pon=y$' .config
           echo "config verified for $TARGET"
 
       - name: Download sources
@@ -289,6 +299,31 @@ jobs:
           else
             echo "no kernel .config found under build_dir, skipping"
           fi
+
+          # Same file release-gpon.yml fingerprints, for the same reason: the
+          # kernel takes the gpon line mode either way, but without the
+          # pon_userspace patch the PON page offers no way to pick it. The
+          # quotes are part of the pattern because a bare "gpon" also matches
+          # the pre-existing "xgpon".
+          page=''
+          for f in $(find build_dir \
+                       -path '*/www/luci-static/resources/view/pon/config.js' \
+                       -print 2>/dev/null); do
+            page="$f"
+            break
+          done
+          if [ -z "$page" ]; then
+            echo "::error::luci-app-pon was not installed anywhere in build_dir"
+            find build_dir -path '*pon*' -name 'config.js' -print 2>/dev/null || true
+            exit 1
+          fi
+          echo "checking $page ($(stat -c%s "$page") bytes)"
+          if ! grep -Eq "['\"]gpon['\"]" "$page"; then
+            echo "::error::the installed PON page offers no gpon line mode"
+            grep -o "o\.value('[^']*'" "$page" || true
+            exit 1
+          fi
+          echo "the PON page offers the gpon line mode"
 
       - name: Verify the board images exist
         env:

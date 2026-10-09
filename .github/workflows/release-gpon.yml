@@ -2,13 +2,16 @@ name: Release PonWrt (GPON)
 
 # Fork-friendly build that compiles PonWrt with the AN7581/AN7583 GPON line
 # mode enabled. Diff against the upstream workflow:
-#   * .github/patches is applied to the pon_drivers feed right after
+#   * .github/patches is applied to the pon_drivers feed and
+#     .github/patches/pon_userspace to the pon_userspace feed, both right after
 #     ./scripts/feeds update
 #   * every step that can fail silently now asserts instead
 #
 # Both subtargets are built, which is what upstream release.yml does as well.
-# The GPON change itself lives entirely in the shared airoha-xpon driver, so
-# both subtargets get it from one patch set.
+# The kernel side lives entirely in the shared airoha-xpon driver, so both
+# subtargets get it from one patch set. The UI side is a second, smaller gap:
+# airoha-xpon takes six line modes but the PON page only ever offered four of
+# them, so "gpon" was not selectable in LuCI at all and had to be set with uci.
 #
 # Dispatch this workflow with a tag, then take the sysupgrade image out of the
 # release tarball. Nothing here touches the device.
@@ -92,10 +95,13 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # Must run after the feed is cloned and before make starts. The script
+      # Must run after the feeds are cloned and before make starts. The script
       # aborts the job when a patch no longer applies or an assertion fails.
       - name: Apply GPON patches to the pon_drivers feed
-        run: sh .github/scripts/patch-feed.sh "$PWD"
+        run: sh .github/scripts/patch-feed.sh "$PWD" pon_drivers
+
+      - name: Apply GPON patches to the pon_userspace feed
+        run: sh .github/scripts/patch-feed.sh "$PWD" pon_userspace
 
       - name: Prepare APK signing key
         env:
@@ -127,6 +133,7 @@ jobs:
           grep -q '^CONFIG_PACKAGE_kmod-airoha-xpon=y$' .config
           grep -q '^CONFIG_PACKAGE_kmod-airoha-en7572=m$' .config
           grep -q '^CONFIG_PACKAGE_airoha-ponctl=y$' .config
+          grep -q '^CONFIG_PACKAGE_luci-app-pon=y$' .config
           echo "config verified for $TARGET"
 
       - name: Download sources
@@ -165,6 +172,37 @@ jobs:
             exit 1
           fi
           echo "patch fingerprint present ($found)"
+
+      # The second half of the change: without it the kernel answers GPON while
+      # LuCI still offers only the four 10G modes. The PON page is a plain file
+      # in the rootfs, so it can be fingerprinted directly. uglifyjs rewrites
+      # the formatting, not the string literals, hence matching the quoted mode
+      # name rather than anything about the surrounding code.
+      #
+      # The quotes are part of the pattern on purpose: a bare "gpon" also
+      # matches the pre-existing "xgpon", which is exactly the entry that was
+      # already there.
+      - name: Verify the PON page offers the GPON line mode
+        run: |
+          page=''
+          for f in $(find build_dir \
+                       -path '*/www/luci-static/resources/view/pon/config.js' \
+                       -print 2>/dev/null); do
+            page="$f"
+            break
+          done
+          if [ -z "$page" ]; then
+            echo "::error::luci-app-pon was not installed anywhere in build_dir"
+            find build_dir -path '*pon*' -name 'config.js' -print 2>/dev/null || true
+            exit 1
+          fi
+          echo "checking $page ($(stat -c%s "$page") bytes)"
+          if ! grep -Eq "['\"]gpon['\"]" "$page"; then
+            echo "::error::the installed PON page offers no gpon line mode"
+            grep -o "o\.value('[^']*'" "$page" || true
+            exit 1
+          fi
+          echo "the PON page offers the gpon line mode"
 
       # Advisory only. OpenWrt keeps logs/package/<step>.txt for failed steps;
       # a successful package build may leave no log at all, so this must not

@@ -1,0 +1,41 @@
+From: WorkBuddy <noreply@localhost>
+Subject: [PATCH] luci-app-pon: offer the GPON line mode
+
+The AN7581/AN7583 xpon driver accepts six line modes (gpon, xgpon, xgspon,
+epon-1g, epon-10g-1g, epon-10g-10g) but this dropdown only ever listed four of
+them: GPON was missing, so the mode that the AN7581 GPON build actually enables
+could not be selected from the UI and had to be set through uci by hand.
+
+GPON carries the same PLOAM registration identity as XG-PON, so serial_number
+and registration_id have to stay visible for it as well.
+
+Signed-off-by: WorkBuddy <noreply@localhost>
+
+diff --git a/luci-app-pon/htdocs/luci-static/resources/view/pon/config.js b/luci-app-pon/htdocs/luci-static/resources/view/pon/config.js
+index b5ab038..2cb329c 100644
+--- a/luci-app-pon/htdocs/luci-static/resources/view/pon/config.js
++++ b/luci-app-pon/htdocs/luci-static/resources/view/pon/config.js
+@@ -137,6 +137,7 @@ return view.extend({
+ 		o = s.option(form.ListValue, 'mode', _('Line mode'));
+ 		o.default = '';
+ 		o.value('', _('Driver default'));
++		o.value('gpon', _('GPON'));
+ 		o.value('xgpon', _('XG-PON'));
+ 		o.value('xgspon', _('XGS-PON'));
+ 		o.value('epon-10g-1g', _('10G-EPON 10G/1G'));
+@@ -147,6 +148,7 @@ return view.extend({
+ 		o.rmempty = true;
+ 		o.validate = validateSerialNumber;
+ 		o.depends('mode', '');
++		o.depends('mode', 'gpon');
+ 		o.depends('mode', 'xgpon');
+ 		o.depends('mode', 'xgspon');
+ 
+@@ -154,6 +156,7 @@ return view.extend({
+ 		o.password = true;
+ 		o.rmempty = true;
+ 		o.depends('mode', '');
++		o.depends('mode', 'gpon');
+ 		o.depends('mode', 'xgpon');
+ 		o.depends('mode', 'xgspon');
+ 		o.validate = asciiLength(1, 36);
