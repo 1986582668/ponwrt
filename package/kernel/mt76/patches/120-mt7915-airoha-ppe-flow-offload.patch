@@ -1,0 +1,189 @@
+From: WorkBuddy <noreply@localhost>
+Subject: [PATCH] wifi: mt76: mt7915: report DEV_PATH_MTK_WDMA to the Airoha PPE
+
+mt7915_net_fill_forward_path() was compiled only under
+CONFIG_NET_MEDIATEK_SOC_WED and returned -ENODEV unless the mediatek WED was
+running.  On an Airoha AN7581 the PPE does the same job, so the function is
+compiled unconditionally now and also answers when an Airoha PPE sits behind
+the device.
+
+That is the whole host side of it.  airoha_ppe_foe_entry_prepare() reaches
+dev_fill_forward_path() through airoha_ppe_get_wdma_info() and, once the last
+hop comes back as DEV_PATH_MTK_WDMA, programs FE_PSE_PORT_CDM4 together with
+AIROHA_FOE_IB2_NBQ, AIROHA_FOE_ACTDP and AIROHA_FOE_MAC_WDMA_BAND/WCID from
+what it got.  wdma_idx has to carry the band index on this side, so the WED
+ring id is only used when the WED is the one actually owning the queue.
+
+The PPE is taken through airoha_ppe_get_dev() and only recorded in the mt7915
+private structure.  It is deliberately not routed through mt76_npu_init():
+that one hands dev->dma_dev, hwrro_mode and rx_token_size to the NPU, and
+setting dev->mmio.npu makes mt76_npu_device_active() true, which switches the
+generic TX and RX code (mt76_dma_tx_queue_skb, mt76_rx_poll_complete) over to
+the eagle descriptor layout and to RRO-style reordering.  MT7915 and MT7916
+are kite chips and speak neither, even though the forward path is exactly the
+same question.
+
+The wireless -> wired direction is not covered: it needs HW-RRO for RX packet
+reordering, and kite chips publish no RRO ring.
+
+Signed-off-by: WorkBuddy <noreply@localhost>
+
+--- a/mt7915/main.c
++++ b/mt7915/main.c
+@@ -1804,7 +1804,12 @@ out:
+ 	return ret;
+ }
+ 
+-#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++/*
++ * Answers with DEV_PATH_MTK_WDMA, which is what both the mediatek WED and the
++ * Airoha PPE consume. It is not tied to CONFIG_NET_MEDIATEK_SOC_WED: on an
++ * Airoha SoC the PPE does the job the WED does on a mediatek one, and
++ * mtk_wed_device_active() is a constant false there.
++ */
+ static int
+ mt7915_net_fill_forward_path(struct ieee80211_hw *hw,
+ 			     struct ieee80211_vif *vif,
+@@ -1818,7 +1823,14 @@ mt7915_net_fill_forward_path(struct ieee80211_hw *hw,
+ 	struct mt7915_phy *phy = mt7915_hw_phy(hw);
+ 	struct mtk_wed_device *wed = &dev->mt76.mmio.wed;
+ 
+-	if (!mtk_wed_device_active(wed))
++	/*
++	 * Only advertise the offload once the SoC side is up. Without a running
++	 * WED there is no ring to steer into, and without an Airoha PPE behind
++	 * this device the wired side would fall back to treating the frame as if
++	 * it had left through a wired port.
++	 */
++	if (!mtk_wed_device_active(wed) &&
++	    !rcu_access_pointer(dev->ppe_dev))
+ 		return -ENODEV;
+ 
+ 	if (msta->wcid.idx > MT7915_WTBL_STA)
+@@ -1826,7 +1838,19 @@ mt7915_net_fill_forward_path(struct ieee80211_hw *hw,
+ 
+ 	path->type = DEV_PATH_MTK_WDMA;
+ 	path->dev = ctx->dev;
+-	path->mtk_wdma.wdma_idx = wed->wdma_idx;
++	/*
++	 * airoha_ppe_get_wdma_info() copies wdma_idx straight into the
++	 * AIROHA_FOE_IB2_NBQ and AIROHA_FOE_MAC_WDMA_BAND fields of the FOE
++	 * entry, so on the Airoha side the value the PPE has to be given is the
++	 * band, not a WED ring index.
++	 */
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	if (mtk_wed_device_active(wed))
++		path->mtk_wdma.wdma_idx = wed->wdma_idx;
++	else
++#endif
++		path->mtk_wdma.wdma_idx = phy->mt76->band_idx;
++
+ 	path->mtk_wdma.bss = mvif->mt76.idx;
+ 	path->mtk_wdma.queue = phy->mt76->band_idx;
+ 	if (test_bit(MT_WCID_FLAG_4ADDR, &msta->wcid.flags) ||
+@@ -1839,7 +1863,6 @@ mt7915_net_fill_forward_path(struct ieee80211_hw *hw,
+ 
+ 	return 0;
+ }
+-#endif
+ 
+ static void
+ mt7915_reconfig_complete(struct ieee80211_hw *hw,
+@@ -1907,8 +1930,8 @@ const struct ieee80211_ops mt7915_ops = {
+ 	.sta_add_debugfs = mt7915_sta_add_debugfs,
+ #endif
+ 	.set_radar_background = mt7915_set_radar_background,
+-#ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	.net_fill_forward_path = mt7915_net_fill_forward_path,
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	.net_setup_tc = mt76_wed_net_setup_tc,
+ #endif
+ 	.reconfig_complete = mt7915_reconfig_complete,
+--- a/mt7915/mt7915.h
++++ b/mt7915/mt7915.h
+@@ -267,6 +267,20 @@ struct mt7915_dev {
+ 	u32 q_int_mask[MT7915_MAX_QUEUE];
+ 	u32 wfdma_mask;
+ 
++	/*
++	 * Airoha PPE behind this device, present only on boards that declare one
++	 * through the "airoha,eth" phandle on the PCIe node. The wired side asks
++	 * dev_fill_forward_path() where a station's traffic egresses and programs
++	 * FE_PSE_PORT_CDM4 from the answer, so the only thing this driver has to
++	 * do is give a correct answer.
++	 *
++	 * This deliberately does not go through mt76_npu_init(): setting
++	 * dev->mmio.npu would make mt76_npu_device_active() true and switch the
++	 * generic DMA and RX code over to the eagle descriptor layout, which the
++	 * kite chips (MT7915/MT7916) do not speak.
++	 */
++	struct airoha_ppe_dev __rcu *ppe_dev;
++
+ 	const struct mt76_bus_ops *bus_ops;
+ 	struct mt7915_phy phy;
+ 
+--- a/mt7915/pci.c
++++ b/mt7915/pci.c
+@@ -100,6 +100,36 @@ static int mt7915_pci_hif2_probe(struct pci_dev *pdev)
+ 	return 0;
+ }
+ 
++static int mt7915_ppe_attach(struct mt7915_dev *dev)
++{
++	struct airoha_ppe_dev *ppe_dev;
++
++	ppe_dev = airoha_ppe_get_dev(dev->mt76.dev);
++	if (IS_ERR(ppe_dev))
++		return PTR_ERR(ppe_dev);
++
++	/*
++	 * With CONFIG_NET_AIROHA=n airoha_ppe_get_dev() is a stub that returns a
++	 * bare NULL instead of an ERR_PTR.
++	 */
++	if (!ppe_dev)
++		return -ENODEV;
++
++	rcu_assign_pointer(dev->ppe_dev, ppe_dev);
++
++	return 0;
++}
++
++static void mt7915_ppe_detach(struct mt7915_dev *dev)
++{
++	struct airoha_ppe_dev *ppe_dev;
++
++	ppe_dev = rcu_dereference_protected(dev->ppe_dev, 1);
++	RCU_INIT_POINTER(dev->ppe_dev, NULL);
++	if (ppe_dev)
++		airoha_ppe_put_dev(ppe_dev);
++}
++
+ static int mt7915_pci_probe(struct pci_dev *pdev,
+ 			    const struct pci_device_id *id)
+ {
+@@ -136,6 +166,17 @@ static int mt7915_pci_probe(struct pci_dev *pdev,
+ 	mdev = &dev->mt76;
+ 	mt7915_wfsys_reset(dev);
+ 
++	/*
++	 * Record the Airoha PPE so the wired side can learn the wireless egress
++	 * queue for a station through the netdev forward path. The PPE calls
++	 * mt7915_net_fill_forward_path() from airoha_ppe_foe_entry_prepare() and
++	 * programs FE_PSE_PORT_CDM4 with the band and wcid it gets back.
++	 */
++	if (mt7915_ppe_attach(dev))
++		dev_info(mdev->dev, "airoha PPE flow offload unavailable\n");
++	else
++		dev_info(mdev->dev, "airoha PPE flow offload enabled\n");
++
+ 	ret = mt7915_mmio_wed_init(dev, pdev, true, &irq);
+ 	if (ret < 0)
+ 		goto free_wed_or_irq_vector;
+@@ -217,6 +258,7 @@ static void mt7915_pci_remove(struct pci_dev *pdev)
+ 
+ 	mdev = pci_get_drvdata(pdev);
+ 	dev = container_of(mdev, struct mt7915_dev, mt76);
++	mt7915_ppe_detach(dev);
+ 	mt7915_put_hif2(dev->hif2);
+ 	mt7915_unregister_device(dev);
+ }

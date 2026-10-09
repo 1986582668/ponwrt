@@ -1,33 +1,38 @@
-name: Release PonWrt (WiFi TX offload)
+name: Release PonWrt (WiFi flow offload)
 
 # Fork-friendly build that compiles PonWrt for the AN7581 HG5585F with the
-# Airoha NPU wired->wireless offload wired into mt7915. Diff against
-# release-gpon.yml in the same directory:
-#   * package/kernel/mt76 carries an extra patch and an extra Makefile block,
-#     both committed into the tree, so the step below only asserts them
-#   * the mt7915e module is fingerprinted after the build
-#   * only the an7581 subtarget is built, and the image glob is pinned to the
-#     HG5585F profiles
+# Airoha PPE wired->wireless flow offload wired into mt7915.
 #
-# What the change does, and what it deliberately does not:
+# What the change does:
 #
-#   mt7915_net_fill_forward_path() used to be compiled only under
-#   CONFIG_NET_MEDIATEK_SOC_WED and bailed out unless the mediatek WED was
-#   active. The Airoha NPU replaces the WED on this SoC, so the function is
-#   now compiled unconditionally and also reports DEV_PATH_MTK_WDMA when
-#   mt76_npu_device_active() is true, with wdma_idx set to the band.
+#   mt7915_net_fill_forward_path() used to live behind
+#   CONFIG_NET_MEDIATEK_SOC_WED and bail out unless the mediatek WED was
+#   running.  The Airoha PPE asks the very same question through
+#   dev_fill_forward_path(), so the function is compiled unconditionally now
+#   and also answers when an Airoha PPE sits behind the device, reporting
+#   DEV_PATH_MTK_WDMA with wdma_idx set to the band.
 #
-#   airoha_ppe_foe_entry_prepare() in the kernel already calls
-#   dev_fill_forward_path() and programs FE_PSE_PORT_CDM4 plus
-#   AIROHA_FOE_MAC_WDMA_BAND/WCID with what comes back, so the wired side
-#   needs nothing new.
+#   Nothing else is needed on the host.  airoha_ppe_foe_entry_prepare() calls
+#   airoha_ppe_get_wdma_info(), sees DEV_PATH_MTK_WDMA on the last hop and
+#   programs FE_PSE_PORT_CDM4 plus AIROHA_FOE_IB2_NBQ / AIROHA_FOE_ACTDP /
+#   AIROHA_FOE_MAC_WDMA_BAND / AIROHA_FOE_MAC_WDMA_WCID from the answer.
 #
-#   Not done here: the wireless->wired direction. mt76_npu_init() hardcodes
-#   "NPU offloading requires HW-RRO for RX packet reordering" and sets
-#   dev->hwrro_mode; MT7916 is a kite chip and publishes no RRO ring, so that
-#   path is not just missing code but a different data path. mt7915 therefore
-#   only calls the new mt76_npu_attach(), which records the NPU without
-#   touching dev->dma_dev, hwrro_mode or rx_token_size.
+# What it deliberately does NOT do:
+#
+#   No mt76_npu_init().  That helper is for the eagle chips: it sets
+#   dev->dma_dev, hwrro_mode and rx_token_size, and recording the NPU in
+#   dev->mmio.npu would make mt76_npu_device_active() true, which flips both
+#   mt76_dma_tx_queue_skb() and mt76_rx_poll_complete() over to the eagle
+#   descriptor layout and to RRO-style reordering.  MT7915/MT7916 are kite
+#   chips and speak neither.  The patch only takes a reference on the PPE and
+#   stores it in the mt7915 private structure.
+#
+#   No wireless->wired direction.  It needs HW-RRO for RX packet reordering
+#   and kite chips publish no RRO ring; that is a missing hardware capability,
+#   not missing code.
+#
+#   No mt76 package Makefile change: CONFIG_MT76_NPU stays off for
+#   kmod-mt7915e, because none of the generic NPU plumbing is used.
 
 on:
   workflow_dispatch:
@@ -94,45 +99,77 @@ jobs:
           restore-keys: |
             ponwrt-dl-${{ matrix.target }}-
 
-      # The mt76 change lives in the tree, so a checkout that lost it must
-      # stop the run before a single object is compiled. Both halves are
-      # checked: the patch that has to be picked up by the package build, and
-      # the Makefile block that turns CONFIG_MT76_NPU on for kmod-mt7915e.
-      - name: Verify the mt76 tree carries the offload change
+      # The whole host-side change lives in the tree, so a checkout that lost
+      # it has to stop the run before a single object is compiled.  Three
+      # separate promises are checked: the patch that the mt76 package has to
+      # pick up, the kernel config that provides the airoha PPE, and the board
+      # device tree that declares the offload.
+      - name: Verify the tree carries the offload change
         run: |
-          patch=package/kernel/mt76/patches/120-mt7915-airoha-npu-tx-offload.patch
+          patch=package/kernel/mt76/patches/120-mt7915-airoha-ppe-flow-offload.patch
           test -f "$patch" || {
             echo "::error::$patch is missing from the tree"
             ls -l package/kernel/mt76/patches/
             exit 1
           }
+
+          # Only strings that live inside code hunks, so a patch that lost its
+          # hunks but kept its commit message cannot pass.
           for token in \
-              'mt76_npu_attach' \
-              'airoha_ppe_get_wdma_info' \
-              'CONFIG_NET_MEDIATEK_SOC_WED'; do
-            grep -q "$token" "$patch" || {
-              echo "::error::$patch does not mention $token"
+              'mt7915_ppe_attach' \
+              'airoha_ppe_get_dev(dev->mt76.dev)' \
+              'rcu_access_pointer(dev->ppe_dev)' \
+              'path->mtk_wdma.wdma_idx = phy->mt76->band_idx;'; do
+            grep -qF "$token" "$patch" || {
+              echo "::error::$patch does not contain: $token"
               exit 1
             }
           done
+          echo "the mt7915 flow offload patch is present"
 
-          # The kmod-mt7915e branch specifically has to add the generic NPU
-          # flags; depth-aware so the nested ifdefs cannot cut the scan short.
+          # The abandoned NPU-based attempt would re-add mt76_npu_attach() and
+          # force CONFIG_MT76_NPU on for kmod-mt7915e, which hijacks TX and RX.
+          stale=package/kernel/mt76/patches/120-mt7915-airoha-npu-tx-offload.patch
+          test ! -e "$stale" || {
+            echo "::error::$stale is still in the tree"
+            exit 1
+          }
+
           awk '
             /^ifdef CONFIG_PACKAGE_kmod-mt7915e/ { in_blk = 1; depth = 0; found = 0; next }
             !in_blk { next }
             /^ifdef/ || /^ifneq/ { depth++; next }
             /^endif/ { if (depth == 0) { in_blk = 0 } else { depth-- }; next }
             /CONFIG_MT76_NPU/ { found = 1 }
-            END { exit found ? 0 : 1 }
+            END { exit found ? 1 : 0 }
           ' package/kernel/mt76/Makefile || {
-            echo "::error::the kmod-mt7915e branch does not add CONFIG_MT76_NPU"
+            echo "::error::the kmod-mt7915e branch must not turn CONFIG_MT76_NPU on"
             grep -n -A14 'CONFIG_PACKAGE_kmod-mt7915e' package/kernel/mt76/Makefile
             exit 1
           }
-          echo "kmod-mt7915e adds the generic NPU flags"
+          echo "kmod-mt7915e leaves CONFIG_MT76_NPU off"
 
-          echo "mt76 offload change present"
+          kconfig=target/linux/airoha/an7581/config-6.18
+          grep -q '^CONFIG_NET_AIROHA=y$' "$kconfig" || {
+            echo "::error::$kconfig lacks CONFIG_NET_AIROHA"
+            exit 1
+          }
+          grep -q '^CONFIG_NET_AIROHA_NPU=y$' "$kconfig" || {
+            echo "::error::$kconfig lacks CONFIG_NET_AIROHA_NPU"
+            exit 1
+          }
+          echo "the an7581 kernel config enables the airoha offload engine"
+
+          dts=target/linux/airoha/dts/an7581-fiberhome-hg5585f-common.dtsi
+          grep -q 'airoha,eth' "$dts" || {
+            echo "::error::$dts does not declare airoha,eth"
+            exit 1
+          }
+          grep -q 'airoha,npu' "$dts" || {
+            echo "::error::$dts does not declare airoha,npu"
+            exit 1
+          }
+          echo "the HG5585F device tree declares the offload"
 
       - name: Install feeds
         run: |
@@ -164,10 +201,15 @@ jobs:
           ./scripts/kconfig.pl + "configs/$TARGET.config" configs/release.config > .config
           make defconfig
 
+          # Kconfig drops unknown symbols silently, so assert the config that
+          # actually matters.  Only top level symbols can be checked here:
+          # target/linux/airoha/an7581/config-6.18 is a kernel fragment and is
+          # merged into the kernel .config at prepare time, so it never shows
+          # up in this file.  The kernel side is asserted in the tree check
+          # above and re-checked after the build.
           grep -q "^CONFIG_TARGET_airoha_${TARGET}=y$" .config
           grep -q "^${DEVICE_SYMBOL}$" .config
           echo "board symbol verified: $DEVICE_SYMBOL"
-          grep -q '^CONFIG_NET_AIROHA_NPU=y$' .config
           grep -q '^CONFIG_PACKAGE_kmod-mt76-core=m$' .config
           grep -q '^CONFIG_PACKAGE_kmod-mt7915e=m$' .config
           grep -q '^CONFIG_PACKAGE_kmod-mt7916-firmware=m$' .config
@@ -180,7 +222,8 @@ jobs:
       - name: Build ${{ matrix.target }}
         run: make -j"$(nproc)"
 
-      # End-to-end proof that the firmware carries the patched drivers.
+      # End-to-end proof that the firmware carries the patched driver and that
+      # the kernel it links against really has the Airoha offload engine.
       #
       # Fingerprint on text that is reachable from code, so it lives in an
       # allocated section: OpenWrt packs kernel modules through
@@ -209,18 +252,43 @@ jobs:
           }
 
           # mt7915e.ko: the new dev_info() line in mt7915_pci_probe().
-          check 'airoha NPU offload' \
+          check 'airoha PPE flow offload' \
                 -name 'mt7915e.ko*'
-
-          # mt76.ko: the newly exported symbol, whose name string lives in
-          # __ksymtab_strings.
-          check 'mt76_npu_attach' \
-                -name 'mt76.ko*'
 
           # Unchanged GPON proof, so a tree that silently lost the feed patch
           # fails here too.
           check 'digital RX mode readback' \
                 -name 'airoha-xpon-xgpon.o' -o -name 'airoha-xpon.ko*'
+
+          # The kernel has to export the PPE handle the driver now asks for.
+          # A missing export would already make modpost fail while linking
+          # mt7915e.ko, so this only double checks and explains why.
+          kmod=build_dir/target-*/linux-*/linux-*/Module.symvers
+          if ls $kmod >/dev/null 2>&1; then
+            grep -q 'airoha_ppe_get_dev' $kmod || {
+              echo "::error::the kernel does not export airoha_ppe_get_dev"
+              exit 1
+            }
+            echo "kernel exports airoha_ppe_get_dev"
+          else
+            echo "no Module.symvers found, skipping the export check"
+          fi
+
+          # Re-check the kernel build itself picked the fragment up.
+          kcfg=$(find build_dir -maxdepth 4 -name .config -path '*/linux-*/*' 2>/dev/null | head -1)
+          if [ -n "$kcfg" ]; then
+            grep -q '^CONFIG_NET_AIROHA=y$' "$kcfg" || {
+              echo "::error::$kcfg lacks CONFIG_NET_AIROHA"
+              exit 1
+            }
+            grep -q '^CONFIG_NET_AIROHA_NPU=y$' "$kcfg" || {
+              echo "::error::$kcfg lacks CONFIG_NET_AIROHA_NPU"
+              exit 1
+            }
+            echo "kernel .config carries the airoha offload engine: $kcfg"
+          else
+            echo "no kernel .config found under build_dir, skipping"
+          fi
 
       - name: Verify the board images exist
         env:
@@ -282,7 +350,7 @@ jobs:
             release/sha256sums
             --repo "$GITHUB_REPOSITORY"
             --target "$GITHUB_SHA"
-            --title "PonWrt $RELEASE_TAG (WiFi TX offload)"
+            --title "PonWrt $RELEASE_TAG (WiFi flow offload)"
             --generate-notes
           )
           if [ "$PRERELEASE" = true ]; then
