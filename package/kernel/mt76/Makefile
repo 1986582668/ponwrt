@@ -483,6 +483,13 @@ ifdef CONFIG_PACKAGE_kmod-mt7915e
     PKG_MAKE_FLAGS += CONFIG_MT798X_WMAC=y
     NOSTDINC_FLAGS += -DCONFIG_MT798X_WMAC
   endif
+  # MT7915/MT7916 are kite chips: the Airoha NPU never takes their data
+  # path over, but the wired PPE still drives their WDMA queues through
+  # the netdev forward path, so the generic NPU layer is needed.
+  ifdef CONFIG_TARGET_airoha_an7581
+    PKG_MAKE_FLAGS += CONFIG_MT76_NPU=y
+    NOSTDINC_FLAGS += -DCONFIG_MT76_NPU
+  endif
 endif
 ifdef CONFIG_PACKAGE_kmod-mt792x-common
   PKG_MAKE_FLAGS += CONFIG_MT792x_LIB=m

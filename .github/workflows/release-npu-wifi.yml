@@ -1,0 +1,291 @@
+name: Release PonWrt (WiFi TX offload)
+
+# Fork-friendly build that compiles PonWrt for the AN7581 HG5585F with the
+# Airoha NPU wired->wireless offload wired into mt7915. Diff against
+# release-gpon.yml in the same directory:
+#   * package/kernel/mt76 carries an extra patch and an extra Makefile block,
+#     both committed into the tree, so the step below only asserts them
+#   * the mt7915e module is fingerprinted after the build
+#   * only the an7581 subtarget is built, and the image glob is pinned to the
+#     HG5585F profiles
+#
+# What the change does, and what it deliberately does not:
+#
+#   mt7915_net_fill_forward_path() used to be compiled only under
+#   CONFIG_NET_MEDIATEK_SOC_WED and bailed out unless the mediatek WED was
+#   active. The Airoha NPU replaces the WED on this SoC, so the function is
+#   now compiled unconditionally and also reports DEV_PATH_MTK_WDMA when
+#   mt76_npu_device_active() is true, with wdma_idx set to the band.
+#
+#   airoha_ppe_foe_entry_prepare() in the kernel already calls
+#   dev_fill_forward_path() and programs FE_PSE_PORT_CDM4 plus
+#   AIROHA_FOE_MAC_WDMA_BAND/WCID with what comes back, so the wired side
+#   needs nothing new.
+#
+#   Not done here: the wireless->wired direction. mt76_npu_init() hardcodes
+#   "NPU offloading requires HW-RRO for RX packet reordering" and sets
+#   dev->hwrro_mode; MT7916 is a kite chip and publishes no RRO ring, so that
+#   path is not just missing code but a different data path. mt7915 therefore
+#   only calls the new mt76_npu_attach(), which records the NPU without
+#   touching dev->dma_dev, hwrro_mode or rx_token_size.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag
+        required: true
+        type: string
+      prerelease:
+        description: Mark as prerelease
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-npu-wifi-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: an7581
+            device_symbol: 'CONFIG_TARGET_DEVICE_airoha_an7581_DEVICE_fiberhome_hg5585f-cu=y'
+            image_glob: '*fiberhome_hg5585f*sysupgrade*'
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Free build space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: ponwrt-dl-${{ matrix.target }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          restore-keys: |
+            ponwrt-dl-${{ matrix.target }}-
+
+      # The mt76 change lives in the tree, so a checkout that lost it must
+      # stop the run before a single object is compiled. Both halves are
+      # checked: the patch that has to be picked up by the package build, and
+      # the Makefile block that turns CONFIG_MT76_NPU on for kmod-mt7915e.
+      - name: Verify the mt76 tree carries the offload change
+        run: |
+          patch=package/kernel/mt76/patches/120-mt7915-airoha-npu-tx-offload.patch
+          test -f "$patch" || {
+            echo "::error::$patch is missing from the tree"
+            ls -l package/kernel/mt76/patches/
+            exit 1
+          }
+          for token in \
+              'mt76_npu_attach' \
+              'airoha_ppe_get_wdma_info' \
+              'CONFIG_NET_MEDIATEK_SOC_WED'; do
+            grep -q "$token" "$patch" || {
+              echo "::error::$patch does not mention $token"
+              exit 1
+            }
+          done
+
+          # The kmod-mt7915e branch specifically has to add the generic NPU
+          # flags; depth-aware so the nested ifdefs cannot cut the scan short.
+          awk '
+            /^ifdef CONFIG_PACKAGE_kmod-mt7915e/ { in_blk = 1; depth = 0; found = 0; next }
+            !in_blk { next }
+            /^ifdef/ || /^ifneq/ { depth++; next }
+            /^endif/ { if (depth == 0) { in_blk = 0 } else { depth-- }; next }
+            /CONFIG_MT76_NPU/ { found = 1 }
+            END { exit found ? 0 : 1 }
+          ' package/kernel/mt76/Makefile || {
+            echo "::error::the kmod-mt7915e branch does not add CONFIG_MT76_NPU"
+            grep -n -A14 'CONFIG_PACKAGE_kmod-mt7915e' package/kernel/mt76/Makefile
+            exit 1
+          }
+          echo "kmod-mt7915e adds the generic NPU flags"
+
+          echo "mt76 offload change present"
+
+      - name: Install feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # Must run after the feed is cloned and before make starts. The script
+      # aborts the job when a patch no longer applies or an assertion fails.
+      - name: Apply GPON patches to the pon_drivers feed
+        run: sh .github/scripts/patch-feed.sh "$PWD"
+
+      - name: Prepare APK signing key
+        env:
+          PONWRT_APK_PRIVATE_KEY: ${{ secrets.PONWRT_APK_PRIVATE_KEY }}
+        run: |
+          if [ -n "$PONWRT_APK_PRIVATE_KEY" ]; then
+            umask 077
+            printf '%s\n' "$PONWRT_APK_PRIVATE_KEY" > private-key.pem
+            openssl ec -in private-key.pem -pubout -out public-key.pem
+          else
+            echo "no PONWRT_APK_PRIVATE_KEY secret; the build generates a throwaway key"
+          fi
+
+      - name: Configure ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+          DEVICE_SYMBOL: ${{ matrix.device_symbol }}
+        run: |
+          ./scripts/kconfig.pl + "configs/$TARGET.config" configs/release.config > .config
+          make defconfig
+
+          grep -q "^CONFIG_TARGET_airoha_${TARGET}=y$" .config
+          grep -q "^${DEVICE_SYMBOL}$" .config
+          echo "board symbol verified: $DEVICE_SYMBOL"
+          grep -q '^CONFIG_NET_AIROHA_NPU=y$' .config
+          grep -q '^CONFIG_PACKAGE_kmod-mt76-core=m$' .config
+          grep -q '^CONFIG_PACKAGE_kmod-mt7915e=m$' .config
+          grep -q '^CONFIG_PACKAGE_kmod-mt7916-firmware=m$' .config
+          grep -q '^CONFIG_PACKAGE_kmod-airoha-xpon=y$' .config
+          echo "config verified for $TARGET"
+
+      - name: Download sources
+        run: make download -j"$(nproc)"
+
+      - name: Build ${{ matrix.target }}
+        run: make -j"$(nproc)"
+
+      # End-to-end proof that the firmware carries the patched drivers.
+      #
+      # Fingerprint on text that is reachable from code, so it lives in an
+      # allocated section: OpenWrt packs kernel modules through
+      # scripts/strip-kmod.sh, whose "objcopy -x -G __this_module
+      # --strip-unneeded" drops every non-allocated section. .rodata and
+      # __ksymtab_strings survive; .modinfo does not.
+      - name: Verify the built modules came from the patched sources
+        run: |
+          check() {
+            fingerprint="$1"; shift
+            found=''
+            for f in $(find build_dir \
+                         \( "$@" \) -print 2>/dev/null); do
+              if strings "$f" 2>/dev/null | grep -q "$fingerprint"; then
+                echo "fingerprint '$fingerprint' present in $f"
+                found="$f"
+                break
+              fi
+            done
+            if [ -z "$found" ]; then
+              echo "::error::no built module carries '$fingerprint', refusing to release"
+              echo "--- candidates inspected ---"
+              find build_dir \( "$@" \) -exec sh -c 'printf "%10s  %s\n" "$(stat -c%s "$1")" "$1"' _ {} \; 2>/dev/null | head -40
+              exit 1
+            fi
+          }
+
+          # mt7915e.ko: the new dev_info() line in mt7915_pci_probe().
+          check 'airoha NPU offload' \
+                -name 'mt7915e.ko*'
+
+          # mt76.ko: the newly exported symbol, whose name string lives in
+          # __ksymtab_strings.
+          check 'mt76_npu_attach' \
+                -name 'mt76.ko*'
+
+          # Unchanged GPON proof, so a tree that silently lost the feed patch
+          # fails here too.
+          check 'digital RX mode readback' \
+                -name 'airoha-xpon-xgpon.o' -o -name 'airoha-xpon.ko*'
+
+      - name: Verify the board images exist
+        env:
+          TARGET: ${{ matrix.target }}
+          IMAGE_GLOB: ${{ matrix.image_glob }}
+        run: |
+          dir="bin/targets/airoha/$TARGET"
+          images=$(find "$dir" -maxdepth 1 -name "$IMAGE_GLOB" -print)
+          [ -n "$images" ] || {
+            echo "::error::no sysupgrade image matching $IMAGE_GLOB for $TARGET"
+            ls -l "$dir"
+            exit 1
+          }
+          echo "$images"
+          echo "image count: $(printf '%s\n' "$images" | wc -l)"
+
+      - name: Pack ${{ matrix.target }}
+        run: |
+          mkdir release
+          tar --zstd -cf "release/ponwrt-${{ matrix.target }}.tar.zst" \
+            -C bin/targets/airoha "${{ matrix.target }}"
+
+      - name: Upload ${{ matrix.target }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ponwrt-${{ matrix.target }}
+          path: release/*.tar.zst
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download firmware archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ponwrt-*
+          path: release
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: release
+        run: sha256sum *.tar.zst > sha256sums
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          args=(
+            "$RELEASE_TAG"
+            release/*.tar.zst
+            release/sha256sums
+            --repo "$GITHUB_REPOSITORY"
+            --target "$GITHUB_SHA"
+            --title "PonWrt $RELEASE_TAG (WiFi TX offload)"
+            --generate-notes
+          )
+          if [ "$PRERELEASE" = true ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "${args[@]}"
